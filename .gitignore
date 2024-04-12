@@ -3,3 +3,7 @@
 .DS_Store
 code/__pycache__/datautils.cpython-312.pyc
 augmented_images
+code/ciri_utils/build/
+code/ciri_utils/build/lib/
+code/ciri_utils/ciri_utils.egg-info/
+launch.json
