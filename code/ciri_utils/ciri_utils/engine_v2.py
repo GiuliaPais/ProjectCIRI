@@ -3,8 +3,12 @@ import os
 import pandas as pd
 import ray
 import tempfile
+import zipfile
+import shutil
+import glob
 
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -213,7 +217,7 @@ def _train_step(model, train_loader, epoch, criterion, optimizer):
     return model, train_loss, accuracy
 
 
-def _eval_step(model, test_loader, epoch, criterion):
+def _eval_step(model, test_loader, epoch, criterion, additional_metrics=None):
     """The single evaluation step for a training loop.
     
     Args:
@@ -227,6 +231,7 @@ def _eval_step(model, test_loader, epoch, criterion):
     """    
     model.eval()
     test_loss, num_correct, num_total = 0, 0, 0
+    all_preds, all_labels = [], []
     with torch.no_grad():
         for X, y in tqdm(test_loader, desc=f"Epoch (test) {epoch}"):
             pred = model(X)
@@ -235,11 +240,34 @@ def _eval_step(model, test_loader, epoch, criterion):
             test_loss += loss.item()
             num_total += y.shape[0]
             num_correct += (pred.argmax(1) == y).sum().item()
+            
+            # Collect all predictions and true labels for additional metrics
+            all_preds.extend(pred.argmax(1).cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
 
     test_loss /= len(test_loader)
     accuracy = num_correct / num_total
-    return test_loss, accuracy
+    add_metrics = {}
+    if additional_metrics:
+        if "confusion_matrix" in additional_metrics:
+            conf_matrix = confusion_matrix(all_labels, all_preds)
+            add_metrics["confusion_matrix"] = (conf_matrix, all_labels, all_preds)
+        if "precision" in additional_metrics:
+            add_metrics["precision"] = precision_score(all_labels, all_preds, average='weighted')
+        if "recall" in additional_metrics:
+            add_metrics["recall"] = recall_score(all_labels, all_preds, average='weighted')
+        if "f1" in additional_metrics:
+            add_metrics["f1"] = f1_score(all_labels, all_preds, average='weighted')
+    return test_loss, accuracy, add_metrics
 
+def _unfreeze_layers(model, layers: list):
+    model_layers = reversed(list(model.named_children()))
+    for name, layer in model_layers:
+        if name in layers:
+            for param in layer.parameters():
+                param.requires_grad = True
+    return model
 
 def _train_func_per_worker(config):
     """The training function for the TorchTrainer. 
@@ -276,13 +304,31 @@ def _train_func_per_worker(config):
     # [0] Initialization
     ### Get the model weights
     model_weights = get_model_weights(model_name)
-    dataset = _load_ciri_dataset(data_folders[0], data_folders[1], model_weights.DEFAULT.transforms())
+    if config.get("weights", None) is not None: # For transfer learning
+        weights_type = config["weights"]
+    else:
+        weights_type = "DEFAULT"
+    weights = getattr(model_weights, weights_type)
+    dataset = _load_ciri_dataset(data_folders[0], data_folders[1], weights.transforms())
     if config.get("sample_indices", None) is not None and config.get("train_test_idx", None) is None:
         sample_indices = config["sample_indices"]
         dataset = _sample_dataset(dataset, sample_indices)
     ### Get the number of classes and the model adjusted
     n_classes = _find_classes(dataset).shape[0]
-    model = get_model(model_name, num_classes=n_classes)
+    if config.get("weights", None) is None:
+        model = get_model(model_name, num_classes=n_classes)
+    else:
+        # Prepare for transfer learning
+        model = get_model(model_name, weights=weights)
+        for param in model.parameters(): # Freeze all layers
+            param.requires_grad = False
+        layers = [name for name, _ in model.named_children()]
+        last_layer = layers[-1]
+        setattr(model, last_layer, torch.nn.Linear(model.fc.in_features, n_classes))
+        # For fine tuning
+        if config.get("unfreeze", None) is not None:
+            model = _unfreeze_layers(model, config["unfreeze"])
+        
     if config.get("optimizer", None) is not None:
         optimizer = config["optimizer"]
     else:
@@ -330,7 +376,8 @@ def _train_func_per_worker(config):
         model, train_loss, train_acc = _train_step(
             model, train_loader, epoch, criterion, optimizer
         )
-        test_loss, test_acc = _eval_step(model, test_loader, epoch, criterion)
+        test_loss, test_acc, add_metrics = _eval_step(model, test_loader, epoch, criterion,
+                                         additional_metrics=config.get("additional_metrics", None))
         scheduler.step(test_loss)
         epoch_summary = pd.Series(
             {
@@ -342,7 +389,7 @@ def _train_func_per_worker(config):
             }
         )
         summary = pd.concat([summary, epoch_summary.to_frame().T], ignore_index=True)
-        metrics={"loss": test_loss, "accuracy": test_acc, "summary": summary.to_dict()}
+        metrics={"loss": test_loss, "accuracy": test_acc, "summary": summary.to_dict(), **add_metrics}
         ### This makes it trainable
         with tempfile.TemporaryDirectory() as tempdir:
             torch.save({"epoch": epoch, "model_state": model.state_dict()}, 
@@ -406,8 +453,9 @@ class CIRI_trainer():
             )
         else:
             scaling_config = ScalingConfig(
-                num_workers=2,
-                use_gpu=False
+                num_workers=os.cpu_count() // 2,
+                use_gpu=False,
+                resources_per_worker={'CPU': 1}
             )
         trainer = TorchTrainer(
             train_loop_per_worker=_train_func_per_worker,
@@ -422,11 +470,21 @@ class CIRI_trainer():
             return trainer.as_trainable()
         return trainer
     
-    def train(self, run_name: str, config=None):
+    def train(self, run_name: str, config=None,
+              persist_dir=None, persist_config={
+                   "whole_folder": False, # whenever possible avoid setting this to true, it's very big
+                    "checkpoint": True,
+                    "results": True,
+                    "params": True,
+                    "progress": True
+              }):
         trainer = self.get_trainer(run_name, config)
-        return trainer.fit()
+        result = trainer.fit()
+        if persist_dir is not None and persist_config:
+            _persist_cv_results(result, persist_dir, run_name, persist_config)
+        return result
     
-    def tune_hyperparams(self, run_name: str, param_space=None, scheduler=None, num_samples=10):
+    def _get_tuner(self, run_name: str, param_space=None, scheduler=None, num_samples=10):
         if param_space is None:
             raise ValueError("param_space is None. Please provide a dictionary of hyperparameters to tune.")
         trainable_ciri = self.get_trainer(run_name, as_trainable=True)
@@ -446,8 +504,26 @@ class CIRI_trainer():
             param_space={
                 "train_loop_config": param_space
             },
-            tune_config=tune_config
+            tune_config=tune_config,
+            run_config=RunConfig(
+                name=run_name
+            )
         )
+        return tuner, trainable_ciri
+    
+    def tune_hyperparams(self, run_name: str, param_space=None, scheduler=None, 
+                         num_samples=10, restore=True, restore_path=None): 
+        tuner, trainable = self._get_tuner(run_name, param_space, scheduler, num_samples)
+        if restore_path is None:
+            restore_path = os.path.join(
+            os.path.expanduser("~/ray_results"),
+            run_name)
+        exp_files = glob.glob(f"{restore_path}/experiment_state-*.json")
+        if restore and tuner.can_restore(restore_path) and len(exp_files) > 0:
+            print(f"Restoring tuner from path {restore_path}")
+            tuner = ray.tune.Tuner.restore(restore_path, 
+                                        trainable=trainable,
+                                        restart_errored=True)   
         return tuner.fit()
     
     def cross_validate(self, run_name: str, 
@@ -455,6 +531,27 @@ class CIRI_trainer():
                        outer_cv_k=5, 
                        inner_cv_k=0,
                        tune_hyperparams=False,
+                       results_persist_dir=None,
+                       persist_config={
+                           # Choose what to persist when doing hyperparameter tuning
+                           "hpt": {
+                               "whole_folder": False, # whenever possible avoid setting this to true, it's very big
+                               "checkpoint": False,
+                               "results": True,
+                               "params": True,
+                               "progress": True,
+                               "experiments_summary": True
+                            },
+                           # Choose what to persist when not doing hyperparameter tuning
+                           "no_hpt": {
+                               "whole_folder": False, # whenever possible avoid setting this to true, it's very big
+                               "checkpoint": True,
+                               "results": True,
+                               "params": True,
+                               "progress": True
+                            }
+                       }, 
+                       start_fold=(0,0),
                        *args, **kwargs):
         if config is None:
             config = {}
@@ -464,33 +561,142 @@ class CIRI_trainer():
                 self.config["data_folders"][1], 
                 None
             )
+        if not tune_hyperparams:
+            inner_cv_k = 0
         cv_generator = _get_fold_indices(self.ds.info, 
                                          sample_idx=self.config.get("sample_indices", None),
                                          outer_cv_k=outer_cv_k,
                                          inner_cv_k=inner_cv_k)
         all_results = defaultdict(dict)
         for i, out_idx in enumerate(cv_generator):
+            if i < start_fold[0]:
+                continue
             if inner_cv_k > 0:
+                ## Inner CV exists only if tune hyperparams
                 _, _, inner_cv_generator = out_idx
                 for j, inner_idx in enumerate(inner_cv_generator):
+                    if i < start_fold[0] and j < start_fold[1]:
+                        continue
                     print(f"Outer fold {i}, inner fold {j} - number of samples: {len(inner_idx[0])}")
                     config["train_test_idx"] = inner_idx
                     mod_run_name = f"{run_name}_outer_{i}_inner_{j}"
                     if tune_hyperparams:
-                        tuner = self.tune_hyperparams(mod_run_name, config, *args, **kwargs)
-                        results = tuner.fit()
-                    else:
-                        results = self.train(mod_run_name, config)
+                        print(f"Tuning hyperparameters for {mod_run_name}...")
+                        results = self.tune_hyperparams(mod_run_name, config, *args, **kwargs)
+                        if results_persist_dir is not None:
+                            _persist_hp_results(results, results_persist_dir,
+                                                mod_run_name, persist_config["hpt"])
                     all_results[i][j] = results
             else:
                 print(f"Outer fold {i} - number of samples: {len(out_idx[0])}")
                 config["train_test_idx"] = out_idx
                 mod_run_name = f"{run_name}_outer_{i}"
                 if tune_hyperparams:
-                    tuner = self.tune_hyperparams(mod_run_name, config, *args, **kwargs)
-                    results = tuner.fit()
+                    results = self.tune_hyperparams(mod_run_name, config, *args, **kwargs)
+                    if results_persist_dir is not None:
+                        _persist_hp_results(results, results_persist_dir,
+                                            mod_run_name, persist_config["hpt"])
                 else:
                     results = self.train(mod_run_name, config)
-                all_results[i] = results
+                    _persist_cv_results(results, results_persist_dir,
+                                        mod_run_name, persist_config["no_hpt"])
+                all_results[i] = results  
         return all_results
+
+
+def _persist_hp_results(results_grid, persist_dir, run_name, persist_config):
+    if not os.path.exists(persist_dir):
+        os.makedirs(persist_dir)
+    if persist_config["experiments_summary"]:
+        summary = results_grid.get_dataframe()
+        summary.to_csv(os.path.join(persist_dir, f"hpt_{run_name}_exp_summary.csv"), index=False)
+    best_trial = results_grid.get_best_result(metric='accuracy', mode='max')
+    train_summary = pd.DataFrame.from_dict(best_trial.metrics['summary'])
+    train_summary.to_csv(os.path.join(persist_dir, f"hpt_{run_name}_train_summary.csv"), index=False)
+    if persist_config["whole_folder"]:
+        zip_and_copy(best_trial.path, persist_dir, f"{run_name}_best_trial.zip")
+        # shutil.copytree(best_trial.path,
+        #                 os.path.join(persist_dir, run_name))
+        return
+    
+    run_dir = os.path.join(persist_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    if persist_config["checkpoint"]:
+        best_checkpoint = best_trial.checkpoint.path
+        shutil.copytree(best_checkpoint,
+                        os.path.join(run_dir, "checkpoint"))
+    if persist_config["results"]:
+        shutil.copy(os.path.join(best_trial.path, "result.json"),
+                    os.path.join(run_dir, "result.json"))
+    if persist_config["params"]:
+        shutil.copy(os.path.join(best_trial.path, "params.json"),
+                    os.path.join(run_dir, "params.json"))
+    if persist_config["progress"]:
+        shutil.copy(os.path.join(best_trial.path, "progress.csv"),
+                    os.path.join(run_dir, "progress.csv"))
         
+def _persist_cv_results(result, persist_dir, run_name, persist_config):
+    if not os.path.exists(persist_dir):
+        os.makedirs(persist_dir)
+    train_summary = pd.DataFrame.from_dict(result.metrics['summary'])
+    train_summary.to_csv(os.path.join(persist_dir, f"{run_name}_train_summary.csv"), index=False)
+    if persist_config["whole_folder"]:
+        zip_and_copy(result.path, persist_dir, f"{run_name}.zip")
+        return
+    
+    run_dir = os.path.join(persist_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    if persist_config["results"]:
+        shutil.copy(os.path.join(result.path, "result.json"),
+                    os.path.join(run_dir, "result.json"))
+    if persist_config["params"]:
+        shutil.copy(os.path.join(result.path, "params.json"),
+                    os.path.join(run_dir, "params.json"))
+    if persist_config["progress"]:
+        shutil.copy(os.path.join(result.path, "progress.csv"),
+                    os.path.join(run_dir, "progress.csv"))
+    if persist_config["checkpoint"]:
+        best_checkpoint = result.get_best_checkpoint(metric='accuracy', mode='max')
+        shutil.copytree(best_checkpoint.path,
+                        os.path.join(run_dir, "checkpoint"))
+    
+    
+
+def zip_and_copy(source_folder, destination_folder, zip_name="archive.zip"):
+    # Ensure the destination folder exists
+    if not os.path.exists(destination_folder):
+        os.makedirs(destination_folder)
+
+    # Path for the output zip file
+    zip_path = os.path.join(destination_folder, zip_name)
+
+    # Creating the zip file
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for root, dirs, files in os.walk(source_folder):
+            for file in files:
+                # Create complete filepath of file in directory
+                file_path = os.path.join(root, file)
+                # Add file to zip
+                zipf.write(file_path, os.path.relpath(file_path, source_folder))
+
+    print(f"Files zipped and saved from {source_folder} to {zip_path}")
+ 
+   
+def unzip_and_extract(source_zip, destination_folder):
+    """
+    Unzips a zip file and extracts its contents into a specified destination folder.
+    
+    Args:
+        source_zip (str): The path to the zip file.
+        destination_folder (str): The directory to which the contents will be extracted.
+    """
+    # Ensure the destination directory exists
+    os.makedirs(destination_folder, exist_ok=True)
+
+    # Open the zip file
+    with zipfile.ZipFile(source_zip, 'r') as zip_ref:
+        # Extract all the contents into the destination directory
+        zip_ref.extractall(destination_folder)
+        print(f"Extracted all contents of {source_zip} to {destination_folder}")
