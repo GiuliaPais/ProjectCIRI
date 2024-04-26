@@ -7,3 +7,5 @@ code/ciri_utils/build/
 code/ciri_utils/build/lib/
 code/ciri_utils/ciri_utils.egg-info/
 launch.json
+code/__pycache__/datautils.cpython-310.pyc
+code/__pycache__/engine.cpython-310.pyc
